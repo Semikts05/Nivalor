@@ -736,12 +736,11 @@ client.on('messageCreate', async message => {
         console.log(`ไม่สามารถสร้าง Social Embed ได้: ${uniqueUrls.join(', ')}`);
     }
 
-    // GREETINGS
     const greetings = ['สวัสดีครับ', 'สวัสดีค่ะ', 'ดีครับ', 'ดีค่ะ', 'ดีจ้า', 'สวัสดีจ้า'];
     if (greetings.some(word => content.includes(word))) {
         return message.reply('โฮกปิ๊บ!');
     }
-;
+});
 
 // MESSAGE UPDATE
 client.on('messageUpdate', (oldMessage, newMessage) => {
