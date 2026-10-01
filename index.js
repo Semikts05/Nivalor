@@ -741,7 +741,7 @@ client.on('messageCreate', async message => {
     if (greetings.some(word => content.includes(word))) {
         return message.reply('โฮกปิ๊บ!');
     }
-);
+;
 
 // MESSAGE UPDATE
 client.on('messageUpdate', (oldMessage, newMessage) => {
