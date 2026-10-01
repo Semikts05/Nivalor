@@ -736,7 +736,7 @@ client.on('messageCreate', async message => {
         console.log(`ไม่สามารถสร้าง Social Embed ได้: ${uniqueUrls.join(', ')}`);
     }
 
-    const greetings = ['สวัสดีครับ', 'สวัสดีค่ะ', 'ดีครับ', 'ดีค่ะ', 'ดีจ้า', 'สวัสดีจ้า'];
+    const greetings = ['ดีครับ'];
     if (greetings.some(word => content.includes(word))) {
         return message.reply('โฮกปิ๊บ!');
     }
@@ -761,7 +761,6 @@ client.on('messageUpdate', (oldMessage, newMessage) => {
 const statusList = [
     { name: 'custom', type: ActivityType.Custom, state: 'โฮกปิ๊บ!' },
     { name: 'custom', type: ActivityType.Custom, state: 'ค่อกก!' },
-    { name: 'custom', type: ActivityType.Custom, state: 'ขู่ฟ่ออ!' },
     { name: 'custom', type: ActivityType.Custom, state: 'โฮกกก!' },
     { name: 'custom', type: ActivityType.Custom, state: 'ROAAR!' },
     { name: 'custom', type: ActivityType.Custom, state: 'GRAAAAH!' },
