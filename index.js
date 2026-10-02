@@ -736,7 +736,7 @@ client.on('messageCreate', async message => {
         console.log(`ไม่สามารถสร้าง Social Embed ได้: ${uniqueUrls.join(', ')}`);
     }
 
-    const greetings = ['นีวาลอร์' 'Nivalor'];
+    const greetings = ['นีวาลอร์' , 'Nivalor'];
     if (greetings.some(word => content.includes(word))) {
         return message.reply('โฮกปิ๊บ!');
     }
