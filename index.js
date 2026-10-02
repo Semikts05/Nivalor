@@ -736,11 +736,11 @@ client.on('messageCreate', async message => {
         console.log(`ไม่สามารถสร้าง Social Embed ได้: ${uniqueUrls.join(', ')}`);
     }
 
-    if (content.includes('นีวาลอร์')) {
+    if (content === 'นีวาลอร์') {
     return message.reply('โฮกปิ๊บ!');
 }
 
-if (content.includes('Nivalor')) {
+if (content === 'Nivalor') {
     return message.reply('GRRRR...');
 }
 });
