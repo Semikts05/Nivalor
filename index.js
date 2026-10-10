@@ -1,11 +1,33 @@
-const { Client, GatewayIntentBits, AuditLogEvent, ActivityType, EmbedBuilder } = require('discord.js');
+'use strict';
+
+const {
+    Client,
+    GatewayIntentBits,
+    Partials,
+    AuditLogEvent,
+    ActivityType,
+    EmbedBuilder,
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle,
+    PermissionFlagsBits
+} = require('discord.js');
+
 const express = require('express');
+
+// ===== WEB SERVER (สำหรับ Render) =====
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.get('/', (req, res) => res.send('ระบบเก็บ Log 24 ชั่วโมงกำลังทำงาน!'));
-app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
+app.get('/', (_req, res) => {
+    res.send('ระบบเก็บ Log 24 ชั่วโมงกำลังทำงาน!');
+});
 
+app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+});
+
+// ===== DISCORD CLIENT =====
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -13,13 +35,16 @@ const client = new Client({
         GatewayIntentBits.GuildVoiceStates,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent
-    ]
+    ],
+    partials: [Partials.Channel, Partials.Message]
 });
 
-const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || '1555046691890012191';
+const LOG_CHANNEL_ID =
+    process.env.LOG_CHANNEL_ID || '1555046691890012191';
+
+// ===== SOCIAL EMBED CONFIG =====
 const IG_PROXY_DOMAIN = 'oginstagram.com';
 
-// Facebook จะลองตัวใหม่ก่อน แล้วค่อย fallback ตัวเก่า
 const FB_PROXY_DOMAINS = [
     'facebed.seria.moe',
     'facebed.com'
@@ -27,14 +52,36 @@ const FB_PROXY_DOMAINS = [
 
 const CACHE_TTL = 10 * 60 * 1000;
 const IG_APP_ID = '936619743392459';
-const IG_DOC_ID = process.env.IG_DOC_ID || '25531498899829322';
+const IG_DOC_ID =
+    process.env.IG_DOC_ID || '25531498899829322';
+
 const metadataCache = new Map();
 
-const INSTAGRAM_UA = 'Googlebot/2.1 (+http://www.google.com/bot.html)';
-const CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
-const DISCORD_BOT_UA = 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)';
+const INSTAGRAM_UA =
+    'Googlebot/2.1 (+http://www.google.com/bot.html)';
 
-// DATE
+const CHROME_UA =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
+
+const DISCORD_BOT_UA =
+    'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)';
+
+// ===== VIRUS / SPAM PROTECTION CONFIG =====
+const VIRUS_WINDOW_MS = 90 * 1000;
+const VIRUS_THRESHOLD = 4;
+const VIRUS_TIMEOUT_MS = 10 * 60 * 1000;
+const VIRUS_DELETE_LOOKBACK_MS = 60 * 60 * 1000;
+
+const virusMessageWindows = new Map();
+const virusHandledUntil = new Map();
+const virusProcessing = new Set();
+const virusActionLocks = new Set();
+
+// ข้อความที่ระบบ Clear กำลังลบ จะถูก Log เองหลังลบสำเร็จ
+// ใช้ป้องกันไม่ให้ Message Delete Event สร้าง Log ซ้ำ
+const virusDeletedMessageIds = new Map();
+
+// ===== DATE / TIME =====
 function getDateStr() {
     const dateString = new Intl.DateTimeFormat('en-GB', {
         timeZone: 'Asia/Bangkok',
@@ -42,24 +89,86 @@ function getDateStr() {
         month: 'numeric',
         year: 'numeric'
     }).format(new Date());
+
     const [day, month, yearCE] = dateString.split('/');
-    return `${day}/${month}/${parseInt(yearCE) + 543}`;
+
+    return `${day}/${month}/${parseInt(yearCE, 10) + 543}`;
 }
 
-// URL
+function getThaiDateTime(timestamp = Date.now()) {
+    return new Intl.DateTimeFormat('th-TH', {
+        timeZone: 'Asia/Bangkok',
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false
+    }).format(new Date(timestamp));
+}
+
+function limitText(text, max) {
+    if (
+        text === null ||
+        text === undefined ||
+        text === ''
+    ) {
+        return '';
+    }
+
+    const value = String(text);
+
+    return value.length <= max
+        ? value
+        : `${value.slice(0, max - 3)}...`;
+}
+
+async function getLogChannel(guild) {
+    if (!guild) return null;
+
+    const channel =
+        guild.channels.cache.get(LOG_CHANNEL_ID) ||
+        await guild.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
+
+    if (
+        !channel ||
+        !channel.isTextBased?.() ||
+        typeof channel.send !== 'function'
+    ) {
+        return null;
+    }
+
+    return channel;
+}
+
+// ===== URL HELPERS =====
 function cleanUrl(url) {
-    return url.replace(/[),.!?;:'"]+$/g, '');
+    return String(url).replace(/[),.!?;:'"]+$/g, '');
 }
 
 function getSocialType(url) {
     try {
-        const hostname = new URL(cleanUrl(url)).hostname.toLowerCase();
-        if (['instagram.com', 'www.instagram.com'].includes(hostname)) {
+        const hostname =
+            new URL(cleanUrl(url)).hostname.toLowerCase();
+
+        if ([
+            'instagram.com',
+            'www.instagram.com'
+        ].includes(hostname)) {
             return 'instagram';
         }
-        if (['facebook.com', 'www.facebook.com', 'm.facebook.com', 'fb.watch'].includes(hostname)) {
+
+        if ([
+            'facebook.com',
+            'www.facebook.com',
+            'm.facebook.com',
+            'fb.watch',
+            'www.fb.watch'
+        ].includes(hostname)) {
             return 'facebook';
         }
+
         return null;
     } catch {
         return null;
@@ -70,24 +179,53 @@ function convertSocialUrl(originalUrl, facebookDomain = null) {
     try {
         const url = new URL(cleanUrl(originalUrl));
         const hostname = url.hostname.toLowerCase();
-        if (['instagram.com', 'www.instagram.com'].includes(hostname)) {
+
+        if ([
+            'instagram.com',
+            'www.instagram.com'
+        ].includes(hostname)) {
             return `https://${IG_PROXY_DOMAIN}${url.pathname}${url.search}${url.hash}`;
         }
-        if (['facebook.com', 'www.facebook.com', 'm.facebook.com', 'fb.watch'].includes(hostname)) {
+
+        if ([
+            'facebook.com',
+            'www.facebook.com',
+            'm.facebook.com',
+            'fb.watch',
+            'www.fb.watch'
+        ].includes(hostname)) {
             const domain = facebookDomain || FB_PROXY_DOMAINS[0];
+
             return `https://${domain}${url.pathname}${url.search}${url.hash}`;
         }
+
         return null;
     } catch {
         return null;
     }
 }
 
-// HTML
+// ===== HTML HELPERS =====
 function decodeHtml(text = '') {
     return String(text)
-        .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
-        .replace(/&#(\d+);/g, (_, num) => String.fromCodePoint(parseInt(num, 10)))
+        .replace(/&#x([0-9a-fA-F]+);/g, (_match, hex) => {
+            const codePoint = parseInt(hex, 16);
+
+            try {
+                return String.fromCodePoint(codePoint);
+            } catch {
+                return _match;
+            }
+        })
+        .replace(/&#(\d+);/g, (_match, num) => {
+            const codePoint = parseInt(num, 10);
+
+            try {
+                return String.fromCodePoint(codePoint);
+            } catch {
+                return _match;
+            }
+        })
         .replace(/&quot;/gi, '"')
         .replace(/&#39;/gi, "'")
         .replace(/&#x27;/gi, "'")
@@ -107,30 +245,34 @@ function stripHtml(text = '') {
     );
 }
 
-function limitText(text, max) {
-    if (!text) return '';
-    return text.length <= max ? text : `${text.slice(0, max - 3)}...`;
+function getMeta(html, name) {
+    const wanted = String(name).toLowerCase();
+    const tags = String(html).match(/<meta\b[^>]*>/gi) || [];
+
+    for (const tag of tags) {
+        const keyMatch = tag.match(
+            /\b(?:property|name)\s*=\s*["']([^"']+)["']/i
+        );
+
+        if (!keyMatch || keyMatch[1].toLowerCase() !== wanted) {
+            continue;
+        }
+
+        const contentMatch = tag.match(
+            /\bcontent\s*=\s*["']([^"']*)["']/i
+        );
+
+        if (contentMatch) {
+            return decodeHtml(contentMatch[1].trim());
+        }
+    }
+
+    return null;
 }
 
-// COUNT / STATS
-function formatCount(value) {
-    if (value === null || value === undefined || value === '') return null;
-    if (typeof value === 'number') return value.toLocaleString('en-US');
-    const text = String(value).trim();
-    if (/^\d+$/.test(text)) return Number(text).toLocaleString('en-US');
-    return text;
-}
-
-function formatStats(likes, comments) {
-    const parts = [];
-    if (likes !== null && likes !== undefined && likes !== '') parts.push(`❤️ ${formatCount(likes)}`);
-    if (comments !== null && comments !== undefined && comments !== '') parts.push(`💬 ${formatCount(comments)}`);
-    return parts.join(' • ');
-}
-
-// URL HELPERS
 function absoluteUrl(url, baseUrl) {
     if (!url) return null;
+
     try {
         return new URL(url, baseUrl).href;
     } catch {
@@ -138,153 +280,295 @@ function absoluteUrl(url, baseUrl) {
     }
 }
 
-function getMeta(html, name) {
-    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const patterns = [
-        new RegExp(`<meta[^>]+property=["']${escaped}["'][^>]+content=["']([^"']*)["'][^>]*>`, 'i'),
-        new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+property=["']${escaped}["'][^>]*>`, 'i'),
-        new RegExp(`<meta[^>]+name=["']${escaped}["'][^>]+content=["']([^"']*)["'][^>]*>`, 'i'),
-        new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+name=["']${escaped}["'][^>]*>`, 'i')
-    ];
-    for (const regex of patterns) {
-        const match = html.match(regex);
-        if (match?.[1]) return decodeHtml(match[1].trim());
+// ===== COUNT / STATS HELPERS =====
+function formatCount(value) {
+    if (
+        value === null ||
+        value === undefined ||
+        value === ''
+    ) {
+        return null;
     }
-    return null;
+
+    if (typeof value === 'number') {
+        return value.toLocaleString('en-US');
+    }
+
+    const text = String(value).trim();
+
+    if (/^\d+$/.test(text)) {
+        return Number(text).toLocaleString('en-US');
+    }
+
+    return text;
 }
 
-// CACHE
+function formatStats(likes, comments) {
+    const parts = [];
+
+    if (
+        likes !== null &&
+        likes !== undefined &&
+        likes !== ''
+    ) {
+        parts.push(`❤️ ${formatCount(likes)}`);
+    }
+
+    if (
+        comments !== null &&
+        comments !== undefined &&
+        comments !== ''
+    ) {
+        parts.push(`💬 ${formatCount(comments)}`);
+    }
+
+    return parts.join(' • ');
+}
+
+// ===== METADATA CACHE =====
 function getCache(key) {
     const cached = metadataCache.get(key);
+
     if (!cached) return null;
+
     if (Date.now() - cached.timestamp > CACHE_TTL) {
         metadataCache.delete(key);
         return null;
     }
+
     return cached.data;
 }
 
 function setCache(key, data) {
-    metadataCache.set(key, { timestamp: Date.now(), data });
+    metadataCache.set(key, {
+        timestamp: Date.now(),
+        data
+    });
+
     if (metadataCache.size > 500) {
         const oldestKey = metadataCache.keys().next().value;
-        if (oldestKey) metadataCache.delete(oldestKey);
+
+        if (oldestKey) {
+            metadataCache.delete(oldestKey);
+        }
     }
 }
 
-// JSON
+// ===== JSON HELPER =====
 function extractBalancedJson(text, start) {
-    if (start < 0 || text[start] !== '{') return null;
+    if (start < 0 || text[start] !== '{') {
+        return null;
+    }
+
     let depth = 0;
     let inString = false;
+
     for (let i = start; i < text.length; i++) {
         const char = text[i];
+
         if (inString) {
-            if (char === '\\') i++;
-            else if (char === '"') inString = false;
+            if (char === '\\') {
+                i++;
+            } else if (char === '"') {
+                inString = false;
+            }
+
             continue;
         }
-        if (char === '"') inString = true;
-        else if (char === '{') depth++;
-        else if (char === '}') {
+
+        if (char === '"') {
+            inString = true;
+        } else if (char === '{') {
+            depth++;
+        } else if (char === '}') {
             depth--;
-            if (depth === 0) return text.slice(start, i + 1);
+
+            if (depth === 0) {
+                return text.slice(start, i + 1);
+            }
         }
     }
+
     return null;
 }
 
-// INSTAGRAM NORMALIZE
+// ===== INSTAGRAM NORMALIZATION =====
 function normalizeInstagramMedia(node) {
-    if (!node || typeof node !== 'object') return null;
+    if (!node || typeof node !== 'object') {
+        return null;
+    }
+
     const user = node.user || node.owner || {};
-    const children = Array.isArray(node.carousel_media) ? node.carousel_media : null;
+    const children = Array.isArray(node.carousel_media)
+        ? node.carousel_media
+        : null;
+
     const first = children?.[0] || node;
-    const pickVideo = item => item?.video_versions?.[0]?.url || null;
-    const pickImage = item => item?.image_versions2?.candidates?.[0]?.url || item?.display_uri || item?.display_url || null;
+
+    const pickVideo = item =>
+        item?.video_versions?.[0]?.url || null;
+
+    const pickImage = item =>
+        item?.image_versions2?.candidates?.[0]?.url ||
+        item?.display_uri ||
+        item?.display_url ||
+        null;
 
     return {
         username: user.username || null,
         fullName: user.full_name || null,
         profilePicUrl: user.profile_pic_url || null,
-        verified: !!user.is_verified,
+        verified: Boolean(user.is_verified),
         caption: node.caption?.text || null,
-        likes: node.like_count ?? node.edge_media_preview_like?.count ?? node.edge_liked_by?.count ?? null,
-        comments: node.comment_count ?? node.edge_media_to_comment?.count ?? null,
-        views: node.play_count ?? node.ig_play_count ?? node.video_view_count ?? node.video_play_count ?? null,
-        takenAt: node.taken_at ?? node.taken_at_timestamp ?? null,
-        isVideo: !!pickVideo(first),
+        likes:
+            node.like_count ??
+            node.edge_media_preview_like?.count ??
+            node.edge_liked_by?.count ??
+            null,
+        comments:
+            node.comment_count ??
+            node.edge_media_to_comment?.count ??
+            null,
+        views:
+            node.play_count ??
+            node.ig_play_count ??
+            node.video_view_count ??
+            node.video_play_count ??
+            null,
+        takenAt:
+            node.taken_at ??
+            node.taken_at_timestamp ??
+            null,
+        isVideo: Boolean(pickVideo(first)),
         videoUrl: pickVideo(first),
         imageUrl: pickImage(first),
-        width: first.original_width || first.dimensions?.width || null,
-        height: first.original_height || first.dimensions?.height || null,
+        width:
+            first.original_width ||
+            first.dimensions?.width ||
+            null,
+        height:
+            first.original_height ||
+            first.dimensions?.height ||
+            null,
         itemCount: children?.length || 1,
-        children: children ? children.map(item => ({
-            isVideo: !!pickVideo(item),
-            videoUrl: pickVideo(item),
-            imageUrl: pickImage(item)
-        })) : null
+        children: children
+            ? children.map(item => ({
+                isVideo: Boolean(pickVideo(item)),
+                videoUrl: pickVideo(item),
+                imageUrl: pickImage(item)
+            }))
+            : null
     };
 }
 
 function normalizeGraphqlMedia(node) {
-    if (!node || typeof node !== 'object') return null;
+    if (!node || typeof node !== 'object') {
+        return null;
+    }
+
     let item = node;
     const children = node.edge_sidecar_to_children?.edges || null;
-    if (children?.length) item = children[0].node;
+
+    if (children?.length) {
+        item = children[0].node;
+    }
+
     const captionEdges = node.edge_media_to_caption?.edges || [];
-    const likes = node.edge_media_preview_like?.count ?? node.edge_liked_by?.count ?? null;
-    const comments = node.edge_media_to_comment?.count ?? null;
 
     return {
         username: node.owner?.username || null,
         fullName: node.owner?.full_name || null,
         profilePicUrl: node.owner?.profile_pic_url || null,
-        verified: !!node.owner?.is_verified,
-        caption: captionEdges.length ? captionEdges[0].node.text : null,
-        likes,
-        comments,
-        views: node.video_view_count ?? node.video_play_count ?? null,
+        verified: Boolean(node.owner?.is_verified),
+        caption: captionEdges.length
+            ? captionEdges[0].node.text
+            : null,
+        likes:
+            node.edge_media_preview_like?.count ??
+            node.edge_liked_by?.count ??
+            null,
+        comments: node.edge_media_to_comment?.count ?? null,
+        views:
+            node.video_view_count ??
+            node.video_play_count ??
+            null,
         takenAt: node.taken_at_timestamp || null,
-        isVideo: !!item.is_video,
+        isVideo: Boolean(item.is_video),
         videoUrl: item.video_url || null,
-        imageUrl: item.display_url || node.display_url || node.thumbnail_src || null,
+        imageUrl:
+            item.display_url ||
+            node.display_url ||
+            node.thumbnail_src ||
+            null,
         width: item.dimensions?.width || null,
         height: item.dimensions?.height || null,
         itemCount: children?.length || 1,
-        children: children ? children.map(edge => ({
-            isVideo: !!edge.node.is_video,
-            videoUrl: edge.node.video_url || null,
-            imageUrl: edge.node.display_url || null
-        })) : null
+        children: children
+            ? children.map(edge => ({
+                isVideo: Boolean(edge.node.is_video),
+                videoUrl: edge.node.video_url || null,
+                imageUrl: edge.node.display_url || null
+            }))
+            : null
     };
 }
 
 function parseInstagramOg(html, finalUrl) {
-    const title = getMeta(html, 'og:title') || getMeta(html, 'twitter:title') || '';
-    const description = getMeta(html, 'og:description') || getMeta(html, 'twitter:description') || '';
-    const image = getMeta(html, 'og:image') || getMeta(html, 'twitter:image') || '';
+    const title =
+        getMeta(html, 'og:title') ||
+        getMeta(html, 'twitter:title') ||
+        '';
+
+    const description =
+        getMeta(html, 'og:description') ||
+        getMeta(html, 'twitter:description') ||
+        '';
+
+    const image =
+        getMeta(html, 'og:image') ||
+        getMeta(html, 'twitter:image') ||
+        '';
+
     const ogUrl = getMeta(html, 'og:url') || '';
 
-    let username = null, fullName = null, likes = null, comments = null, caption = null;
+    let username = null;
+    let fullName = null;
+    let likes = null;
+    let comments = null;
+    let caption = null;
+
     const authorMatch = title.match(/^(.+?)\s*\(@([^)]+)\)/);
+
     if (authorMatch) {
         fullName = authorMatch[1].trim();
         username = authorMatch[2].trim();
     } else {
-        const usernameMatch = ogUrl.match(/instagram\.com\/([A-Za-z0-9_.]+)\/(?:p|reel|reels|tv)\//i);
-        if (usernameMatch) username = usernameMatch[1];
+        const usernameMatch = ogUrl.match(
+            /instagram\.com\/([A-Za-z0-9_.]+)\/(?:p|reel|reels|tv)\//i
+        );
+
+        if (usernameMatch) {
+            username = usernameMatch[1];
+        }
     }
 
-    const statsMatch = decodeHtml(description).match(/^([\d,.KM]+)\s+likes?,\s+([\d,.KM]+)\s+comments?/i);
+    const decodedDescription = decodeHtml(description);
+
+    const statsMatch = decodedDescription.match(
+        /^([\d,.KM]+)\s+likes?,\s+([\d,.KM]+)\s+comments?/i
+    );
+
     if (statsMatch) {
         likes = statsMatch[1];
         comments = statsMatch[2];
     }
 
-    const captionMatch = decodeHtml(description).match(/on\s+[A-Z][a-z]+\s+\d+,\s+\d{4}:\s*["“](.*)["”]\s*$/s);
+    const captionMatch = decodedDescription.match(
+        /\bon\s+[A-Z][a-z]+\s+\d{1,2},\s+\d{4}:\s*["“](.*)["”]\s*$/s
+    );
+
     if (captionMatch) {
-        caption = captionMatch[1].replace(/["”]\s*$/, '').trim();
+        caption = captionMatch[1].trim();
     } else if (description && !statsMatch) {
         caption = stripHtml(description);
     }
@@ -292,42 +576,77 @@ function parseInstagramOg(html, finalUrl) {
     if (!image && !username) return null;
 
     return {
-        username, fullName, profilePicUrl: null, caption, likes, comments,
-        views: null, takenAt: null, isVideo: false, videoUrl: null,
-        imageUrl: absoluteUrl(image, finalUrl), width: null, height: null, itemCount: 1
+        username,
+        fullName,
+        profilePicUrl: null,
+        caption,
+        likes,
+        comments,
+        views: null,
+        takenAt: null,
+        isVideo: false,
+        videoUrl: null,
+        imageUrl: absoluteUrl(image, finalUrl),
+        width: null,
+        height: null,
+        itemCount: 1
     };
 }
 
-// FETCH INSTAGRAM METADATA
+// ===== FETCH INSTAGRAM METADATA =====
 async function fetchInstagramGooglebot(code) {
     try {
         const url = `https://www.instagram.com/p/${code}/`;
+
         const response = await fetch(url, {
-            headers: { 'User-Agent': INSTAGRAM_UA, 'Accept-Language': 'en-US,en;q=0.9' },
+            headers: {
+                'User-Agent': INSTAGRAM_UA,
+                'Accept-Language': 'en-US,en;q=0.9'
+            },
             redirect: 'follow',
             signal: AbortSignal.timeout(15000)
         });
+
         if (!response.ok) return null;
+
         const html = await response.text();
         const finalUrl = response.url || url;
+
         let media = null;
         const index = html.indexOf('"xig_polaris_media":');
+
         if (index !== -1) {
             const start = html.indexOf('{', index);
             const raw = extractBalancedJson(html, start);
+
             if (raw) {
                 try {
                     const parsed = JSON.parse(raw);
-                    const node = parsed.if_not_gated_logged_out || (parsed.media_type ? parsed : null);
-                    if (node) media = normalizeInstagramMedia(node);
+
+                    const node =
+                        parsed.if_not_gated_logged_out ||
+                        (parsed.media_type ? parsed : null);
+
+                    if (node) {
+                        media = normalizeInstagramMedia(node);
+                    }
                 } catch (error) {
-                    console.log(`อ่าน xig_polaris_media ไม่สำเร็จ: ${error.message}`);
+                    console.log(
+                        `อ่าน xig_polaris_media ไม่สำเร็จ: ${error.message}`
+                    );
                 }
             }
         }
-        return { media, og: parseInstagramOg(html, finalUrl) };
+
+        return {
+            media,
+            og: parseInstagramOg(html, finalUrl)
+        };
     } catch (error) {
-        console.log(`Instagram Googlebot request ไม่สำเร็จ: ${error.message}`);
+        console.log(
+            `Instagram Googlebot request ไม่สำเร็จ: ${error.message}`
+        );
+
         return null;
     }
 }
@@ -335,88 +654,199 @@ async function fetchInstagramGooglebot(code) {
 async function fetchInstagramGraphql(code) {
     try {
         const body = new URLSearchParams({
-            av: '0', __d: 'www', __user: '0', __a: '1', __comet_req: '7', lsd: 'AVqbxe3J_YA',
-            fb_api_caller_class: 'RelayModern', fb_api_req_friendly_name: 'PolarisPostActionLoadPostQueryQuery',
-            variables: JSON.stringify({ shortcode: code, fetch_comment_count: 40, parent_comment_count: 24, child_comment_count: 3, fetch_like_count: 10, fetch_tagged_user_count: null, fetch_preview_comment_count: 2, has_threaded_comments: true, hoisted_comment_id: null, hoisted_reply_id: null }),
-            server_timestamps: 'true', doc_id: IG_DOC_ID
+            av: '0',
+            __d: 'www',
+            __user: '0',
+            __a: '1',
+            __comet_req: '7',
+            lsd: 'AVqbxe3J_YA',
+            fb_api_caller_class: 'RelayModern',
+            fb_api_req_friendly_name:
+                'PolarisPostActionLoadPostQueryQuery',
+            variables: JSON.stringify({
+                shortcode: code,
+                fetch_comment_count: 40,
+                parent_comment_count: 24,
+                child_comment_count: 3,
+                fetch_like_count: 10,
+                fetch_tagged_user_count: null,
+                fetch_preview_comment_count: 2,
+                has_threaded_comments: true,
+                hoisted_comment_id: null,
+                hoisted_reply_id: null
+            }),
+            server_timestamps: 'true',
+            doc_id: IG_DOC_ID
         });
-        const response = await fetch('https://www.instagram.com/graphql/query/', {
-            method: 'POST',
-            headers: {
-                'User-Agent': CHROME_UA, 'Accept': '*/*', 'Content-Type': 'application/x-www-form-urlencoded',
-                'Cookie': 'csrftoken=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 'X-CSRFToken': 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-                'X-IG-App-ID': IG_APP_ID, 'X-Asbd-Id': '129477', 'X-Fb-Friendly-Name': 'PolarisPostActionLoadPostQueryQuery',
-                'Origin': 'https://www.instagram.com', 'Referer': `https://www.instagram.com/p/${code}/`
-            },
-            body: body.toString(),
-            signal: AbortSignal.timeout(15000)
-        });
+
+        const response = await fetch(
+            'https://www.instagram.com/graphql/query/',
+            {
+                method: 'POST',
+                headers: {
+                    'User-Agent': CHROME_UA,
+                    'Accept': '*/*',
+                    'Content-Type':
+                        'application/x-www-form-urlencoded',
+                    'Cookie':
+                        'csrftoken=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+                    'X-CSRFToken':
+                        'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+                    'X-IG-App-ID': IG_APP_ID,
+                    'X-Asbd-Id': '129477',
+                    'X-Fb-Friendly-Name':
+                        'PolarisPostActionLoadPostQueryQuery',
+                    'Origin': 'https://www.instagram.com',
+                    'Referer':
+                        `https://www.instagram.com/p/${code}/`
+                },
+                body: body.toString(),
+                signal: AbortSignal.timeout(15000)
+            }
+        );
+
         if (!response.ok) return null;
+
         const data = await response.json().catch(() => null);
-        const node = data?.data?.xdt_shortcode_media || data?.data?.shortcode_media;
+
+        const node =
+            data?.data?.xdt_shortcode_media ||
+            data?.data?.shortcode_media;
+
         return node ? normalizeGraphqlMedia(node) : null;
     } catch (error) {
-        console.log(`Instagram GraphQL ไม่สำเร็จ: ${error.message}`);
+        console.log(
+            `Instagram GraphQL ไม่สำเร็จ: ${error.message}`
+        );
+
         return null;
     }
 }
 
 async function fetchInstagramProfileFeed(username, code) {
     try {
-        const response = await fetch(`https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`, {
-            headers: { 'User-Agent': CHROME_UA, 'X-IG-App-ID': IG_APP_ID },
-            signal: AbortSignal.timeout(15000)
-        });
+        const response = await fetch(
+            `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`,
+            {
+                headers: {
+                    'User-Agent': CHROME_UA,
+                    'X-IG-App-ID': IG_APP_ID
+                },
+                signal: AbortSignal.timeout(15000)
+            }
+        );
+
         if (!response.ok) return null;
+
         const data = await response.json().catch(() => null);
         const user = data?.data?.user;
         const edges = user?.edge_owner_to_timeline_media?.edges;
+
         if (!edges) return null;
-        const edge = edges.find(item => item?.node?.shortcode === code);
+
+        const edge = edges.find(
+            item => item?.node?.shortcode === code
+        );
+
         if (!edge?.node) return null;
+
         return normalizeGraphqlMedia({
             ...edge.node,
-            owner: { username, full_name: user.full_name, is_verified: user.is_verified, profile_pic_url: user.profile_pic_url }
+            owner: {
+                username,
+                full_name: user.full_name,
+                is_verified: user.is_verified,
+                profile_pic_url: user.profile_pic_url
+            }
         });
     } catch (error) {
-        console.log(`Instagram profile feed ไม่สำเร็จ: ${error.message}`);
+        console.log(
+            `Instagram profile feed ไม่สำเร็จ: ${error.message}`
+        );
+
         return null;
     }
 }
 
 async function fetchInstagramEmbedPage(code) {
     try {
-        const url = `https://www.instagram.com/p/${code}/embed/captioned/`;
+        const url =
+            `https://www.instagram.com/p/${code}/embed/captioned/`;
+
         const response = await fetch(url, {
-            headers: { 'User-Agent': CHROME_UA, 'Accept-Language': 'en-US,en;q=0.9' },
+            headers: {
+                'User-Agent': CHROME_UA,
+                'Accept-Language': 'en-US,en;q=0.9'
+            },
             redirect: 'follow',
             signal: AbortSignal.timeout(15000)
         });
+
         if (!response.ok) return null;
+
         const html = await response.text();
         const gqlIndex = html.indexOf('\\"gql_data\\"');
+
         if (gqlIndex !== -1) {
-            const raw = extractBalancedJson(html, html.indexOf('{', gqlIndex));
+            const raw = extractBalancedJson(
+                html,
+                html.indexOf('{', gqlIndex)
+            );
+
             if (raw) {
                 try {
-                    const decoded = JSON.parse(JSON.parse(`"${raw}"`));
-                    const node = decoded?.shortcode_media || decoded?.xdt_shortcode_media;
-                    if (node) return normalizeGraphqlMedia(node);
+                    const decoded = JSON.parse(
+                        JSON.parse(`"${raw}"`)
+                    );
+
+                    const node =
+                        decoded?.shortcode_media ||
+                        decoded?.xdt_shortcode_media;
+
+                    if (node) {
+                        return normalizeGraphqlMedia(node);
+                    }
                 } catch (error) {
-                    console.log(`อ่าน Instagram embed JSON ไม่สำเร็จ: ${error.message}`);
+                    console.log(
+                        `อ่าน Instagram embed JSON ไม่สำเร็จ: ${error.message}`
+                    );
                 }
             }
         }
-        const imageMatch = html.match(/class="EmbeddedMediaImage"[^>]*src="([^"]+)"/i);
-        const usernameMatch = html.match(/class="UsernameText"[^>]*>([^<]+)</i);
+
+        const imageMatch = html.match(
+            /class="EmbeddedMediaImage"[^>]*src="([^"]+)"/i
+        );
+
+        const usernameMatch = html.match(
+            /class="UsernameText"[^>]*>([^<]+)</i
+        );
+
         if (imageMatch) {
             return {
-                username: usernameMatch?.[1]?.trim() || null, fullName: null, profilePicUrl: null, caption: null, likes: null, comments: null, views: null, takenAt: null, isVideo: false, videoUrl: null, imageUrl: decodeHtml(imageMatch[1]), width: null, height: null, itemCount: 1
+                username: usernameMatch?.[1]?.trim() || null,
+                fullName: null,
+                profilePicUrl: null,
+                caption: null,
+                likes: null,
+                comments: null,
+                views: null,
+                takenAt: null,
+                isVideo: false,
+                videoUrl: null,
+                imageUrl: decodeHtml(imageMatch[1]),
+                width: null,
+                height: null,
+                itemCount: 1
             };
         }
+
         return null;
     } catch (error) {
-        console.log(`Instagram embed page ไม่สำเร็จ: ${error.message}`);
+        console.log(
+            `Instagram embed page ไม่สำเร็จ: ${error.message}`
+        );
+
         return null;
     }
 }
@@ -424,42 +854,80 @@ async function fetchInstagramEmbedPage(code) {
 async function fetchInstagramMetadata(originalUrl) {
     const cleanedUrl = cleanUrl(originalUrl);
     const cached = getCache(cleanedUrl);
+
     if (cached) return cached;
 
     try {
         const original = new URL(cleanedUrl);
         let code = null;
         const path = original.pathname;
-        const postMatch = path.match(/\/(?:[^/]+\/)?(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)/i);
+
+        const postMatch = path.match(
+            /\/(?:[^/]+\/)?(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)/i
+        );
+
         if (postMatch) code = postMatch[1];
 
         if (!code && path.startsWith('/share/')) {
             try {
-                const shareResponse = await fetch(`https://www.instagram.com${path}${original.search}`, {
-                    headers: { 'User-Agent': CHROME_UA },
-                    redirect: 'manual',
-                    signal: AbortSignal.timeout(10000)
-                });
-                const location = shareResponse.headers.get('location');
+                const shareResponse = await fetch(
+                    `https://www.instagram.com${path}${original.search}`,
+                    {
+                        headers: { 'User-Agent': CHROME_UA },
+                        redirect: 'manual',
+                        signal: AbortSignal.timeout(10000)
+                    }
+                );
+
+                const location =
+                    shareResponse.headers.get('location');
+
                 if (location) {
-                    const resolved = new URL(location, 'https://www.instagram.com');
-                    const match = resolved.pathname.match(/\/(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)/i);
+                    const resolved = new URL(
+                        location,
+                        'https://www.instagram.com'
+                    );
+
+                    const match = resolved.pathname.match(
+                        /\/(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)/i
+                    );
+
                     if (match) code = match[1];
                 }
             } catch (error) {
-                console.log(`Instagram share link resolve ไม่สำเร็จ: ${error.message}`);
+                console.log(
+                    `Instagram share link resolve ไม่สำเร็จ: ${error.message}`
+                );
             }
         }
+
         if (!code) return null;
 
-        const googlebotResult = await fetchInstagramGooglebot(code);
+        const googlebotResult =
+            await fetchInstagramGooglebot(code);
+
         let media = googlebotResult?.media || null;
         const og = googlebotResult?.og || null;
 
-        if (!media) media = await fetchInstagramGraphql(code);
-        if (!media && og?.username) media = await fetchInstagramProfileFeed(og.username, code);
-        if (!media) media = await fetchInstagramEmbedPage(code);
-        if (!media && og?.imageUrl) media = og;
+        if (!media) {
+            media = await fetchInstagramGraphql(code);
+        }
+
+        if (!media && og?.username) {
+            media = await fetchInstagramProfileFeed(
+                og.username,
+                code
+            );
+        }
+
+        if (!media) {
+            media = await fetchInstagramEmbedPage(code);
+        }
+
+        if (!media && og?.imageUrl) {
+            media = og;
+        }
+
         if (!media) return null;
 
         if (og) {
@@ -471,120 +939,232 @@ async function fetchInstagramMetadata(originalUrl) {
             if (!media.imageUrl) media.imageUrl = og.imageUrl;
         }
 
-        const imgIndex = Math.max(1, parseInt(original.searchParams.get('img_index') || '1', 10) || 1);
+        const imgIndex = Math.max(
+            1,
+            parseInt(
+                original.searchParams.get('img_index') || '1',
+                10
+            ) || 1
+        );
+
         let selectedImage = media.imageUrl;
         let selectedVideo = media.videoUrl;
         let selectedIsVideo = media.isVideo;
 
-        if (Array.isArray(media.children) && media.children.length > 0) {
-            const selected = media.children[Math.min(imgIndex - 1, media.children.length - 1)];
+        if (
+            Array.isArray(media.children) &&
+            media.children.length > 0
+        ) {
+            const selected = media.children[
+                Math.min(imgIndex - 1, media.children.length - 1)
+            ];
+
             if (selected) {
                 selectedImage = selected.imageUrl || selectedImage;
                 selectedVideo = selected.videoUrl || selectedVideo;
-                selectedIsVideo = !!selected.isVideo;
+                selectedIsVideo = Boolean(selected.isVideo);
             }
         }
 
         const result = {
-            type: 'instagram', originalUrl: cleanedUrl, username: media.username, fullName: media.fullName,
-            profilePicUrl: media.profilePicUrl, caption: media.caption, likes: media.likes, comments: media.comments,
-            views: media.views, takenAt: media.takenAt, imageUrl: selectedImage, videoUrl: selectedVideo,
-            isVideo: selectedIsVideo, itemCount: media.itemCount || 1
+            type: 'instagram',
+            originalUrl: cleanedUrl,
+            username: media.username,
+            fullName: media.fullName,
+            profilePicUrl: media.profilePicUrl,
+            caption: media.caption,
+            likes: media.likes,
+            comments: media.comments,
+            views: media.views,
+            takenAt: media.takenAt,
+            imageUrl: selectedImage,
+            videoUrl: selectedVideo,
+            isVideo: selectedIsVideo,
+            itemCount: media.itemCount || 1
         };
+
         setCache(cleanedUrl, result);
+
         return result;
     } catch (error) {
-        console.log(`Instagram metadata error: ${error.message}`);
+        console.log(
+            `Instagram metadata error: ${error.message}`
+        );
+
         return null;
     }
 }
 
-// FACEBOOK METADATA
+// ===== FACEBOOK METADATA =====
 async function fetchFacebookMetadata(originalUrl) {
     const cleanedUrl = cleanUrl(originalUrl);
     const cached = getCache(cleanedUrl);
+
     if (cached) return cached;
 
     try {
         let bestResult = null;
+
         for (const proxyDomain of FB_PROXY_DOMAINS) {
-            const proxyUrl = convertSocialUrl(cleanedUrl, proxyDomain);
+            const proxyUrl = convertSocialUrl(
+                cleanedUrl,
+                proxyDomain
+            );
+
             if (!proxyUrl) continue;
 
             try {
                 console.log(`🔎 Facebook proxy: ${proxyDomain}`);
+
                 const response = await fetch(proxyUrl, {
                     headers: {
                         'User-Agent': DISCORD_BOT_UA,
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                        'Accept':
+                            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                         'Accept-Language': 'en-US,en;q=0.9'
                     },
                     redirect: 'follow',
                     signal: AbortSignal.timeout(15000)
                 });
+
                 if (!response.ok) {
-                    console.log(`Facebook proxy ${proxyDomain} ตอบ ${response.status}: ${proxyUrl}`);
+                    console.log(
+                        `Facebook proxy ${proxyDomain} ตอบ ${response.status}: ${proxyUrl}`
+                    );
+
                     continue;
                 }
+
                 const html = await response.text();
                 const finalUrl = response.url || proxyUrl;
 
-                const author = getMeta(html, 'og:title') || getMeta(html, 'twitter:title') || '';
-                const caption = getMeta(html, 'og:description') || getMeta(html, 'twitter:description') || '';
-                const image = getMeta(html, 'og:image') || getMeta(html, 'og:image:url') || getMeta(html, 'twitter:image') || '';
-                const siteName = getMeta(html, 'og:site_name') || '';
+                const author =
+                    getMeta(html, 'og:title') ||
+                    getMeta(html, 'twitter:title') ||
+                    '';
 
-                let likes = null, comments = null, dateText = null;
-                const siteParts = siteName.split('\n').map(item => decodeHtml(item).trim()).filter(Boolean);
-                if (siteParts.length >= 2) dateText = siteParts[1];
+                const captionText =
+                    getMeta(html, 'og:description') ||
+                    getMeta(html, 'twitter:description') ||
+                    '';
+
+                const image =
+                    getMeta(html, 'og:image') ||
+                    getMeta(html, 'og:image:url') ||
+                    getMeta(html, 'twitter:image') ||
+                    '';
+
+                const siteName =
+                    getMeta(html, 'og:site_name') || '';
+
+                let likes = null;
+                let comments = null;
+                let dateText = null;
+
+                const siteParts = siteName
+                    .split('\n')
+                    .map(item => decodeHtml(item).trim())
+                    .filter(Boolean);
+
+                if (siteParts.length >= 2) {
+                    dateText = siteParts[1];
+                }
 
                 const statsText = siteParts.slice(2).join(' ');
-                const likesMatch = statsText.match(/(?:❤️|♥️)\s*([\d.,KM]+)/i);
-                const commentsMatch = statsText.match(/💬\s*([\d.,KM]+)/i);
+
+                const likesMatch = statsText.match(
+                    /(?:❤️|♥️)\s*([\d.,KM]+)/i
+                );
+
+                const commentsMatch = statsText.match(
+                    /💬\s*([\d.,KM]+)/i
+                );
 
                 if (likesMatch) likes = likesMatch[1];
                 if (commentsMatch) comments = commentsMatch[1];
 
-                const video = getMeta(html, 'og:video') || getMeta(html, 'twitter:player:stream') || null;
+                const video =
+                    getMeta(html, 'og:video') ||
+                    getMeta(html, 'twitter:player:stream') ||
+                    null;
 
                 const result = {
-                    type: 'facebook', originalUrl: cleanedUrl, fullName: stripHtml(author), username: null,
-                    profilePicUrl: null, caption: stripHtml(caption), likes, comments, dateText,
-                    imageUrl: absoluteUrl(image, finalUrl), videoUrl: video, isVideo: !!video
+                    type: 'facebook',
+                    originalUrl: cleanedUrl,
+                    fullName: stripHtml(author),
+                    username: null,
+                    profilePicUrl: null,
+                    caption: stripHtml(captionText),
+                    likes,
+                    comments,
+                    dateText,
+                    imageUrl: absoluteUrl(image, finalUrl),
+                    videoUrl: video,
+                    isVideo: Boolean(video)
                 };
 
-                if (!result.fullName && !result.caption && !result.imageUrl) {
-                    console.log(`⚠️ Facebook proxy ${proxyDomain} ไม่มีข้อมูลที่ใช้ได้`);
+                if (
+                    !result.fullName &&
+                    !result.caption &&
+                    !result.imageUrl
+                ) {
+                    console.log(
+                        `⚠️ Facebook proxy ${proxyDomain} ไม่มีข้อมูลที่ใช้ได้`
+                    );
+
                     continue;
                 }
 
                 if (result.imageUrl) {
                     setCache(cleanedUrl, result);
-                    console.log(`✅ Facebook image source: ${proxyDomain}`);
+
+                    console.log(
+                        `✅ Facebook image source: ${proxyDomain}`
+                    );
+
                     return result;
                 }
+
                 bestResult ??= result;
             } catch (error) {
-                console.log(`Facebook proxy ${proxyDomain} ไม่สำเร็จ: ${error.message}`);
+                console.log(
+                    `Facebook proxy ${proxyDomain} ไม่สำเร็จ: ${error.message}`
+                );
             }
         }
+
         if (bestResult) {
             setCache(cleanedUrl, bestResult);
-            console.log('⚠️ Facebook metadata ได้ แต่ไม่มี image URL');
+
+            console.log(
+                '⚠️ Facebook metadata ได้ แต่ไม่มี image URL'
+            );
+
             return bestResult;
         }
+
         return null;
     } catch (error) {
-        console.log(`Facebook metadata error: ${error.message}`);
+        console.log(
+            `Facebook metadata error: ${error.message}`
+        );
+
         return null;
     }
 }
 
-// SOCIAL METADATA & EMBED
+// ===== SOCIAL METADATA & EMBED =====
 async function fetchSocialMetadata(originalUrl) {
     const type = getSocialType(originalUrl);
-    if (type === 'instagram') return fetchInstagramMetadata(originalUrl);
-    if (type === 'facebook') return fetchFacebookMetadata(originalUrl);
+
+    if (type === 'instagram') {
+        return fetchInstagramMetadata(originalUrl);
+    }
+
+    if (type === 'facebook') {
+        return fetchFacebookMetadata(originalUrl);
+    }
+
     return null;
 }
 
@@ -592,14 +1172,29 @@ function buildSocialEmbed(data) {
     const isInstagram = data.type === 'instagram';
     const serviceName = isInstagram ? 'Instagram' : 'Facebook';
     const color = isInstagram ? 0xE1306C : 0x1877F2;
-    const ownerName = data.fullName || data.username || serviceName;
-    const ownerLine = data.username && data.fullName ? `${data.fullName} (@${data.username.replace(/^@/, '')})` : ownerName;
+
+    const ownerName =
+        data.fullName ||
+        data.username ||
+        serviceName;
+
+    const ownerLine =
+        data.username && data.fullName
+            ? `${data.fullName} (@${data.username.replace(/^@/, '')})`
+            : ownerName;
+
     const stats = formatStats(data.likes, data.comments);
     const caption = limitText(stripHtml(data.caption || ''), 150);
 
     let description = '';
-    if (stats) description += `${stats}\n\n`;
-    if (caption) description += caption;
+
+    if (stats) {
+        description += `${stats}\n\n`;
+    }
+
+    if (caption) {
+        description += caption;
+    }
 
     const embed = new EmbedBuilder()
         .setColor(color)
@@ -610,212 +1205,1161 @@ function buildSocialEmbed(data) {
         embed.setAuthor({
             name: limitText(ownerLine, 256),
             url: data.originalUrl,
-            ...(data.profilePicUrl ? { iconURL: data.profilePicUrl } : {})
+            ...(data.profilePicUrl
+                ? { iconURL: data.profilePicUrl }
+                : {})
         });
     }
-    if (description) embed.setDescription(description);
-    if (data.imageUrl) embed.setImage(data.imageUrl);
+
+    if (description) {
+        embed.setDescription(description);
+    }
+
+    if (data.imageUrl) {
+        embed.setImage(data.imageUrl);
+    }
 
     if (data.takenAt) {
         const timestamp = Number(data.takenAt);
+
         if (Number.isFinite(timestamp)) {
-            embed.setTimestamp(new Date(timestamp > 1000000000000 ? timestamp : timestamp * 1000));
+            embed.setTimestamp(
+                new Date(
+                    timestamp > 1000000000000
+                        ? timestamp
+                        : timestamp * 1000
+                )
+            );
         }
     }
+
     return embed;
 }
 
-// VOICE LOG
-client.on('voiceStateUpdate', (oldState, newState) => {
-    const logChannel = newState.guild.channels.cache.get(LOG_CHANNEL_ID);
+// ============================================================================
+// VIRUS / SPAM DETECTION
+// เงื่อนไข: สมาชิกส่งข้อความที่มี @everyone และมีไฟล์รูปภาพแนบครบ 4 ข้อความ
+// ภายใน 90 วินาที -> Timeout 10 นาทีและส่ง Log ให้แอดมินเลือกการจัดการ
+// ============================================================================
+
+function hasEveryoneText(message) {
+    return Boolean(
+        message.mentions?.everyone ||
+        String(message.content || '').includes('@everyone')
+    );
+}
+
+function isImageAttachment(attachment) {
+    const contentType =
+        String(attachment.contentType || '').toLowerCase();
+
+    const nameAndUrl =
+        `${attachment.name || ''} ${attachment.url || ''}`;
+
+    return contentType.startsWith('image/') ||
+        /\.(png|jpe?g|jfif|gif|webp|bmp|avif|tiff?)(?:[?#\s]|$)/i.test(nameAndUrl);
+}
+
+// ===== VIRUS ACTION BUTTONS =====
+function createVirusButtons(guildId, targetId, disabled = false) {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId(`virus:kickclear:${guildId}:${targetId}`)
+            .setLabel('Kick and Clear')
+            .setStyle(ButtonStyle.Danger)
+            .setDisabled(disabled),
+
+        new ButtonBuilder()
+            .setCustomId(`virus:clear:${guildId}:${targetId}`)
+            .setLabel('Clear')
+            .setStyle(ButtonStyle.Primary)
+            .setDisabled(disabled),
+
+        new ButtonBuilder()
+            .setCustomId(`virus:nothing:${guildId}:${targetId}`)
+            .setLabel('Nothing')
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(disabled)
+    );
+}
+
+// ===== VIRUS DETECTION HANDLER =====
+async function handleVirusMessage(message) {
+    if (
+        !message.guild ||
+        !message.member ||
+        message.author.bot
+    ) {
+        return false;
+    }
+
+    const hasImage =
+        [...message.attachments.values()].some(isImageAttachment);
+
+    if (!hasEveryoneText(message) || !hasImage) {
+        return false;
+    }
+
+    const now = Date.now();
+    const key = `${message.guild.id}:${message.author.id}`;
+
+    const handledUntil = virusHandledUntil.get(key) || 0;
+
+    if (
+        handledUntil > now ||
+        virusProcessing.has(key)
+    ) {
+        return true;
+    }
+
+    const recent = (virusMessageWindows.get(key) || [])
+        .filter(item => now - item.timestamp <= VIRUS_WINDOW_MS);
+
+    recent.push({
+        timestamp: now,
+        url: message.url
+    });
+
+    virusMessageWindows.set(key, recent);
+
+    if (recent.length < VIRUS_THRESHOLD) {
+        return false;
+    }
+
+    virusProcessing.add(key);
+
+    let timeoutSucceeded = false;
+    let timeoutStatus = '';
+
+    try {
+        if (!message.member.moderatable) {
+            throw new Error(
+                'บอทไม่มีสิทธิ์ Timeout สมาชิกคนนี้ โปรดตรวจสอบสิทธิ์และลำดับยศของบอท'
+            );
+        }
+
+        await message.member.timeout(
+            VIRUS_TIMEOUT_MS,
+            'ตรวจพบข้อความที่มี @everyone และรูปภาพอย่างน้อย 4 ครั้งภายใน 90 วินาที'
+        );
+
+        timeoutSucceeded = true;
+        timeoutStatus = '✅ Timeout สำเร็จ 10 นาที';
+    } catch (error) {
+        timeoutStatus = `❌ Timeout ไม่สำเร็จ: ${error.message}`;
+        console.error('Virus Timeout Error:', error);
+    }
+
+    // ถ้า Timeout สำเร็จ จะไม่แจ้งเหตุซ้ำในช่วง 10 นาที
+    // ถ้า Timeout ล้มเหลว จะอนุญาตให้ลองตรวจใหม่หลัง 30 วินาที
+    virusHandledUntil.set(
+        key,
+        now + (timeoutSucceeded ? VIRUS_TIMEOUT_MS : 30 * 1000)
+    );
+
+    virusProcessing.delete(key);
+
+    const evidence = recent
+        .slice(-4)
+        .map((item, index) => `${index + 1}. ${item.url}`)
+        .join('\n');
+
+    const timeText = getThaiDateTime(now);
+
+    const memberName = limitText(
+        message.member.displayName || message.author.tag,
+        100
+    );
+
+    const logContent = [
+        '🚨 **ตรวจพบข้อความเข้าข่ายสแปม @everyone**',
+        '',
+        `สมาชิก: ${memberName} (${message.author.tag})`,
+        `User ID: ${message.author.id}`,
+        `จำนวน: ${recent.length} ข้อความภายใน 90 วินาที`,
+        `เวลาตรวจพบ: ${timeText} น.`,
+        `ผลการ Timeout: ${timeoutStatus}`,
+        '',
+        `ข้อความที่ทำให้ถึงเกณฑ์: ${message.url}`,
+        '',
+        '**หลักฐาน 4 ข้อความล่าสุดที่เข้าเงื่อนไข**',
+        evidence,
+        '',
+        '🛡️ **แอดมินต้องการจัดการสมาชิกคนนี้อย่างไร?**',
+        '**Kick and Clear** = ลบข้อความ @everyone ย้อนหลัง 1 ชั่วโมง แล้วเตะสมาชิก',
+        '**Clear** = ลบเฉพาะข้อความ @everyone ย้อนหลัง 1 ชั่วโมง',
+        '**Nothing** = ไม่เตะและไม่ลบข้อความ',
+        'ข้อความที่บอทลบจะถูกบันทึกด้วยระบบ Message Delete Log รูปแบบเดียวกับการลบข้อความทั่วไป โดยระบุว่าบอทลบตามคำสั่งของแอดมิน'
+    ].join('\n');
+
+    const logChannel = await getLogChannel(message.guild);
+
+    if (!logChannel) {
+        console.error(
+            'Virus Log: ไม่พบห้อง Log หรือบอทส่งข้อความในห้อง Log ไม่ได้'
+        );
+
+        return true;
+    }
+
+    try {
+        await logChannel.send({
+            content: limitText(logContent, 1900),
+            components: [
+                createVirusButtons(
+                    message.guild.id,
+                    message.author.id
+                )
+            ],
+            allowedMentions: { parse: [] }
+        });
+    } catch (error) {
+        console.error('ส่ง Virus Log ไม่สำเร็จ:', error);
+    }
+
+    return true;
+}
+
+// ===== PERMISSION CHECK FOR CLEAR =====
+function canSearchAndDeleteInChannel(channel, botMember) {
+    if (
+        !channel?.isTextBased?.() ||
+        typeof channel.messages?.fetch !== 'function'
+    ) {
+        return false;
+    }
+
+    try {
+        const permissions = channel.permissionsFor(botMember);
+
+        return Boolean(
+            permissions?.has([
+                PermissionFlagsBits.ViewChannel,
+                PermissionFlagsBits.ReadMessageHistory,
+                PermissionFlagsBits.ManageMessages
+            ])
+        );
+    } catch {
+        return false;
+    }
+}
+
+// ===== PREVENT DUPLICATE DELETE LOGS =====
+function markVirusDeletion(messageId) {
+    const expiry = Date.now() + 60 * 1000;
+
+    virusDeletedMessageIds.set(messageId, expiry);
+
+    const timer = setTimeout(() => {
+        if (virusDeletedMessageIds.get(messageId) === expiry) {
+            virusDeletedMessageIds.delete(messageId);
+        }
+    }, 61 * 1000);
+
+    timer.unref?.();
+}
+
+function consumeVirusDeletionMark(messageId) {
+    const expiry = virusDeletedMessageIds.get(messageId);
+
+    if (!expiry) return false;
+
+    virusDeletedMessageIds.delete(messageId);
+
+    return expiry >= Date.now();
+}
+
+// ===== STANDARD MESSAGE DELETE LOG =====
+// ใช้รูปแบบเดียวกับระบบ Log การลบข้อความทั่วไป
+// หากระบบ Clear เป็นผู้ลบ จะระบุบอทและแอดมินผู้กดคำสั่งให้ชัดเจน
+async function sendMessageDeletionLog(inputMessage, options = {}) {
+    let message = inputMessage;
+
+    if (message?.partial) {
+        message = await message.fetch().catch(() => message);
+    }
+
+    if (!message?.guild || !message.channel) {
+        return false;
+    }
+
+    const logChannel =
+        options.logChannel ||
+        await getLogChannel(message.guild);
+
+    if (!logChannel) {
+        return false;
+    }
+
+    const dateStr = getDateStr();
+
+    const authorTag = message.author
+        ? `<@${message.author.id}>`
+        : 'ไม่ทราบผู้ใช้';
+
+    let executorTag = `${authorTag} ลบเอง`;
+
+    if (options.executorId) {
+        executorTag = `<@${options.executorId}>`;
+
+        if (options.moderatorId) {
+            executorTag +=
+                ` (บอทดำเนินการตามคำสั่งของ <@${options.moderatorId}>)`;
+        }
+    } else {
+        try {
+            const fetchedLogs = await message.guild.fetchAuditLogs({
+                limit: 5,
+                type: AuditLogEvent.MessageDelete
+            });
+
+            const deletionLog = fetchedLogs.entries.find(entry => {
+                const sameTarget =
+                    message.author &&
+                    entry.target?.id === message.author.id;
+
+                const recent =
+                    entry.createdTimestamp > Date.now() - 8000;
+
+                const sameChannel =
+                    entry.extra?.channel?.id === message.channel.id;
+
+                return sameTarget && recent && sameChannel;
+            });
+
+            if (deletionLog?.executor) {
+                executorTag = `<@${deletionLog.executor.id}>`;
+            }
+        } catch {
+            console.log(
+                'บอทอ่าน Audit Log ไม่ได้ หรือไม่มีสิทธิ์'
+            );
+        }
+    }
+
+    let contentLog =
+        `🗑️ ${dateStr} | ลบข้อความของ ${authorTag}\n` +
+        `คนลบ: ${executorTag} | ช่อง: <#${message.channel.id}>`;
+
+    if (message.content) {
+        contentLog += `\nเนื้อหา: ${limitText(message.content, 1000)}`;
+    } else {
+        contentLog +=
+            '\nเนื้อหา: [ไม่มีข้อความหรือ Discord ไม่ได้ส่งเนื้อหามาให้]';
+    }
+
+    contentLog +=
+        `\nลิงก์ข้อความเดิม: https://discord.com/channels/${message.guild.id}/${message.channel.id}/${message.id}`;
+
+    try {
+        await logChannel.send({
+            content: limitText(contentLog, 1900),
+            allowedMentions: { parse: [] }
+        });
+
+        if (message.attachments?.size > 0) {
+            const attachmentUrls = [
+                ...message.attachments.values()
+            ].map(attachment =>
+                `${attachment.name || 'ไฟล์แนบ'}: ${attachment.url}`
+            );
+
+            await logChannel.send({
+                content: limitText(attachmentUrls.join('\n'), 1900),
+                allowedMentions: { parse: [] }
+            });
+        }
+
+        return true;
+    } catch (error) {
+        console.error(
+            `ส่ง Message Delete Log ของข้อความ ${message.id} ไม่สำเร็จ:`,
+            error
+        );
+
+        return false;
+    }
+}
+
+// ===== CLEAR @EVERYONE MESSAGES FROM THE LAST HOUR =====
+async function deleteEveryoneMessagesLastHour(
+    guild,
+    targetId,
+    moderatorId
+) {
+    const cutoff = Date.now() - VIRUS_DELETE_LOOKBACK_MS;
+
+    const botMember =
+        guild.members.me || await guild.members.fetchMe();
+
+    const channels = new Map();
+
+    // โหลดห้องที่บอทเข้าถึงได้
+    const fetchedChannels =
+        await guild.channels.fetch().catch(() => null);
+
+    const channelCollection =
+        fetchedChannels || guild.channels.cache;
+
+    for (const channel of channelCollection.values()) {
+        if (canSearchAndDeleteInChannel(channel, botMember)) {
+            channels.set(channel.id, channel);
+        }
+    }
+
+    // เพิ่ม Active Threads
+    try {
+        const activeThreads =
+            await guild.channels.fetchActiveThreads();
+
+        for (const thread of activeThreads.threads.values()) {
+            if (canSearchAndDeleteInChannel(thread, botMember)) {
+                channels.set(thread.id, thread);
+            }
+        }
+    } catch (error) {
+        console.warn(
+            'ดึง Active Threads ไม่สำเร็จ:',
+            error.message
+        );
+    }
+
+    // พยายามเพิ่ม Archived Threads ที่บอทเข้าถึงได้
+    for (const parent of channelCollection.values()) {
+        if (!parent?.threads?.fetchArchived) continue;
+
+        for (const type of ['public', 'private']) {
+            try {
+                const archived =
+                    await parent.threads.fetchArchived({
+                        type,
+                        fetchAll: true
+                    });
+
+                for (const thread of archived.threads.values()) {
+                    if (canSearchAndDeleteInChannel(thread, botMember)) {
+                        channels.set(thread.id, thread);
+                    }
+                }
+            } catch (error) {
+                console.log(
+                    `ข้าม Archived Threads (${type}) ในห้อง ${parent.id}: ${error.message}`
+                );
+            }
+        }
+    }
+
+    const matchedMessages = new Map();
+
+    let checkedMessages = 0;
+    let readFailures = 0;
+
+    // ค้นหาประวัติในแต่ละห้องทีละ 100 ข้อความ
+    // หยุดเมื่อถึงขอบเขต 1 ชั่วโมงย้อนหลัง
+    for (const channel of channels.values()) {
+        let before;
+
+        while (true) {
+            let batch;
+
+            try {
+                batch = await channel.messages.fetch({
+                    limit: 100,
+                    ...(before ? { before } : {})
+                });
+            } catch (error) {
+                readFailures++;
+
+                console.warn(
+                    `อ่านประวัติห้อง ${channel.id} ไม่สำเร็จ:`,
+                    error.message
+                );
+
+                break;
+            }
+
+            if (batch.size === 0) break;
+
+            checkedMessages += batch.size;
+
+            let oldest = null;
+
+            for (const msg of batch.values()) {
+                if (
+                    !oldest ||
+                    msg.createdTimestamp < oldest.createdTimestamp
+                ) {
+                    oldest = msg;
+                }
+
+                // ต้องเป็นข้อความของสมาชิกเป้าหมาย
+                // และมี @everyone เท่านั้น
+                // ไม่จำเป็นต้องมีรูปภาพในขั้นตอน Clear ย้อนหลัง
+                if (
+                    msg.createdTimestamp >= cutoff &&
+                    msg.author?.id === targetId &&
+                    hasEveryoneText(msg)
+                ) {
+                    matchedMessages.set(msg.id, msg);
+                }
+            }
+
+            if (
+                !oldest ||
+                oldest.createdTimestamp <= cutoff ||
+                batch.size < 100
+            ) {
+                break;
+            }
+
+            before = oldest.id;
+        }
+    }
+
+    const logChannel = await getLogChannel(guild);
+
+    if (!logChannel) {
+        throw new Error(
+            'ไม่พบห้อง Log หรือบอทไม่มีสิทธิ์ส่งข้อความในห้อง Log จึงหยุดการลบ'
+        );
+    }
+
+    let deleted = 0;
+    let deleteFailures = 0;
+    let logFailures = 0;
+
+    for (const msg of matchedMessages.values()) {
+        if (!msg.deletable) {
+            deleteFailures++;
+
+            await logChannel.send({
+                content:
+                    `⚠️ ลบข้อความไม่ได้: ${msg.url}\n` +
+                    'สาเหตุ: บอทไม่มีสิทธิ์ลบข้อความนี้',
+                allowedMentions: { parse: [] }
+            }).catch(console.error);
+
+            continue;
+        }
+
+        try {
+            // ตั้งเครื่องหมายก่อนลบ เพื่อป้องกัน Gateway Event
+            // บันทึกซ้ำกับ Log ที่เราจะส่งหลังลบสำเร็จ
+            markVirusDeletion(msg.id);
+
+            await msg.delete();
+
+            deleted++;
+
+            // ใช้รูปแบบ Message Delete Log ปกติ
+            // โดยระบุว่าบอทลบตามคำสั่งของแอดมินคนใด
+            const logged = await sendMessageDeletionLog(msg, {
+                logChannel,
+                executorId: client.user?.id,
+                moderatorId
+            });
+
+            if (!logged) {
+                logFailures++;
+            }
+        } catch (error) {
+            virusDeletedMessageIds.delete(msg.id);
+            deleteFailures++;
+
+            console.warn(
+                `ลบข้อความ ${msg.id} ไม่สำเร็จ:`,
+                error.message
+            );
+
+            await logChannel.send({
+                content:
+                    `⚠️ ลบข้อความไม่สำเร็จ: ${msg.url}\n` +
+                    `สาเหตุ: ${limitText(error.message, 300)}`,
+                allowedMentions: { parse: [] }
+            }).catch(console.error);
+        }
+    }
+
+    return {
+        channels: channels.size,
+        checked: checkedMessages,
+        found: matchedMessages.size,
+        deleted,
+        deleteFailures,
+        logFailures,
+        readFailures
+    };
+}
+
+// ===== VOICE LOG =====
+client.on('voiceStateUpdate', async (oldState, newState) => {
+    const logChannel = await getLogChannel(newState.guild);
+
     if (!logChannel) return;
 
     const member = newState.member;
+
     if (!member || member.user.bot) return;
 
     const dateStr = getDateStr();
-    const channelName = newState.channel?.name || oldState.channel?.name || 'ไม่ทราบห้อง';
+
+    const channelName =
+        newState.channel?.name ||
+        oldState.channel?.name ||
+        'ไม่ทราบห้อง';
+
+    const lines = [];
 
     if (!oldState.channelId && newState.channelId) {
-        logChannel.send(`${dateStr} <@${member.id}> เข้า **${channelName}**`);
+        lines.push(
+            `${dateStr} <@${member.id}> เข้า **${channelName}**`
+        );
     } else if (oldState.channelId && !newState.channelId) {
-        logChannel.send(`${dateStr} <@${member.id}> ออก **${channelName}**`);
-    } else if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId) {
-        logChannel.send(`${dateStr} <@${member.id}> ย้ายจาก **${oldState.channel.name}** ไป **${channelName}**`);
+        lines.push(
+            `${dateStr} <@${member.id}> ออก **${channelName}**`
+        );
+    } else if (
+        oldState.channelId &&
+        newState.channelId &&
+        oldState.channelId !== newState.channelId
+    ) {
+        lines.push(
+            `${dateStr} <@${member.id}> ย้ายจาก **${oldState.channel.name}** ไป **${channelName}**`
+        );
     }
 
     if (!oldState.selfMute && newState.selfMute) {
-        logChannel.send(`${dateStr} 🎙️ <@${member.id}> **ปิดไมค์**`);
+        lines.push(`${dateStr} 🎙️ <@${member.id}> **ปิดไมค์**`);
     } else if (oldState.selfMute && !newState.selfMute) {
-        logChannel.send(`${dateStr} 🎙️ <@${member.id}> **เปิดไมค์**`);
+        lines.push(`${dateStr} 🎙️ <@${member.id}> **เปิดไมค์**`);
     }
 
     if (!oldState.selfDeaf && newState.selfDeaf) {
-        logChannel.send(`${dateStr} 🔈 <@${member.id}> **ปิดหูฟัง/ลำโพง**`);
+        lines.push(`${dateStr} 🔈 <@${member.id}> **ปิดหูฟัง/ลำโพง**`);
     } else if (oldState.selfDeaf && !newState.selfDeaf) {
-        logChannel.send(`${dateStr} 🔊 <@${member.id}> **เปิดหูฟัง/ลำโพง**`);
+        lines.push(`${dateStr} 🔊 <@${member.id}> **เปิดหูฟัง/ลำโพง**`);
     }
 
     if (!oldState.selfVideo && newState.selfVideo) {
-        logChannel.send(`${dateStr} 📹 <@${member.id}> เริ่ม **เปิดกล้อง** ในห้อง **${channelName}**`);
+        lines.push(
+            `${dateStr} 📹 <@${member.id}> เริ่ม **เปิดกล้อง** ในห้อง **${channelName}**`
+        );
     } else if (oldState.selfVideo && !newState.selfVideo) {
-        logChannel.send(`${dateStr} 📹 <@${member.id}> **ปิดกล้อง** ในห้อง **${channelName}**`);
+        lines.push(
+            `${dateStr} 📹 <@${member.id}> **ปิดกล้อง** ในห้อง **${channelName}**`
+        );
     }
 
     if (!oldState.streaming && newState.streaming) {
-        logChannel.send(`${dateStr} 🛑 <@${member.id}> เริ่ม **สตรีมหน้าจอ** ในห้อง **${channelName}**`);
+        lines.push(
+            `${dateStr} 🛑 <@${member.id}> เริ่ม **สตรีมหน้าจอ** ในห้อง **${channelName}**`
+        );
     } else if (oldState.streaming && !newState.streaming) {
-        logChannel.send(`${dateStr} 🛑 <@${member.id}> **หยุดสตรีมหน้าจอ** ในห้อง **${channelName}**`);
+        lines.push(
+            `${dateStr} 🛑 <@${member.id}> **หยุดสตรีมหน้าจอ** ในห้อง **${channelName}**`
+        );
+    }
+
+    for (const line of lines) {
+        await logChannel.send({
+            content: line,
+            allowedMentions: { parse: [] }
+        }).catch(console.error);
     }
 });
 
-// MESSAGE DELETE
-client.on('messageDelete', async message => {
-    if (!message.guild) return;
-    const logChannel = message.guild.channels.cache.get(LOG_CHANNEL_ID);
-    if (!logChannel) return;
-
-    const dateStr = getDateStr();
-    const authorTag = message.author ? `<@${message.author.id}>` : 'ไม่ทราบผู้ใช้';
-    let executorTag = `${authorTag} ลบเอง`;
-
-    try {
-        const fetchedLogs = await message.guild.fetchAuditLogs({
-            limit: 1,
-            type: AuditLogEvent.MessageDelete
-        });
-        const deletionLog = fetchedLogs.entries.first();
-        if (deletionLog) {
-            const { executor, target, createdTimestamp } = deletionLog;
-            if (message.author && target && target.id === message.author.id && createdTimestamp > Date.now() - 5000) {
-                executorTag = `<@${executor.id}>`;
-            }
-        }
-    } catch {
-        console.log('บอทอ่าน Audit Log ไม่ได้ หรือไม่มีสิทธิ์');
+// ===== MESSAGE DELETE LOG =====
+client.on('messageDelete', async partialMessage => {
+    // ระบบ Clear จะส่ง Message Delete Log เองหลังลบสำเร็จ
+    // เพื่อบันทึกการลบของบอทให้เห็นชัดเจน โดยไม่ให้เกิด Log ซ้ำ
+    if (consumeVirusDeletionMark(partialMessage.id)) {
+        return;
     }
 
-    let contentLog = `🗑️ ${dateStr} | ลบข้อความของ ${authorTag}\nคนลบ : ${executorTag} | ช่อง : <#${message.channel.id}>`;
-    if (message.content) contentLog += `\n"${message.content}"`;
-
-    await logChannel.send(contentLog);
-
-    if (message.attachments.size > 0) {
-        const attachmentUrls = [...message.attachments.values()].map(attachment => attachment.url);
-        await logChannel.send(attachmentUrls.join('\n'));
-    }
+    await sendMessageDeletionLog(partialMessage);
 });
 
-// MESSAGE CREATE
+// ===== MESSAGE CREATE =====
 client.on('messageCreate', async message => {
     if (message.author.bot) return;
 
-    const content = message.content;
-    const socialRegex = /(https?:\/\/(?:www\.)?(?:instagram\.com|facebook\.com|m\.facebook\.com|fb\.watch)\/[^\s<]+)/gi;
+    // ตรวจระบบสแปมก่อนระบบ Social Embed และคำตอบชื่อบอท
+    if (
+        message.guild &&
+        await handleVirusMessage(message)
+    ) {
+        return;
+    }
+
+    const content = message.content || '';
+
+    const socialRegex =
+        /https?:\/\/(?:www\.)?(?:instagram\.com|facebook\.com|m\.facebook\.com|fb\.watch)\/[^\s<]+/gi;
+
     const matches = content.match(socialRegex);
 
     if (matches?.length) {
-        const uniqueUrls = [...new Set(matches.map(cleanUrl))].slice(0, 5);
-        const metadataList = await Promise.all(uniqueUrls.map(fetchSocialMetadata));
+        const uniqueUrls = [
+            ...new Set(matches.map(cleanUrl))
+        ].slice(0, 5);
+
+        const metadataList = await Promise.all(
+            uniqueUrls.map(fetchSocialMetadata)
+        );
+
         const validMetadata = metadataList.filter(Boolean);
 
         if (validMetadata.length > 0) {
-            const embeds = validMetadata.map(buildSocialEmbed).slice(0, 10);
+            const embeds = validMetadata
+                .map(buildSocialEmbed)
+                .slice(0, 10);
+
             try {
-                await message.reply({ embeds, allowedMentions: { repliedUser: false } });
+                await message.reply({
+                    embeds,
+                    allowedMentions: {
+                        repliedUser: false
+                    }
+                });
+
                 setTimeout(() => {
                     message.suppressEmbeds(true).catch(error => {
-                        console.log(`ซ่อน Embed ต้นฉบับไม่ได้: ${error.message}`);
+                        console.log(
+                            `ซ่อน Embed ต้นฉบับไม่ได้: ${error.message}`
+                        );
                     });
                 }, 500);
             } catch (error) {
-                console.log(`ส่ง Social Embed ไม่สำเร็จ: ${error.message}`);
+                console.log(
+                    `ส่ง Social Embed ไม่สำเร็จ: ${error.message}`
+                );
             }
+
             return;
         }
-        console.log(`ไม่สามารถสร้าง Social Embed ได้: ${uniqueUrls.join(', ')}`);
+
+        console.log(
+            `ไม่สามารถสร้าง Social Embed ได้: ${uniqueUrls.join(', ')}`
+        );
     }
 
     if (content === 'นีวาลอร์') {
-    return message.reply('โฮกปิ๊บ!');
-}
+        await message.reply({
+            content: 'โฮกปิ๊บ!',
+            allowedMentions: {
+                repliedUser: false
+            }
+        }).catch(console.error);
 
-if (content === 'Nivalor') {
-    return message.reply('GRRRR...');
-}
-});
+        return;
+    }
 
-// MESSAGE UPDATE
-client.on('messageUpdate', (oldMessage, newMessage) => {
-    if (!newMessage.guild || newMessage.author?.bot || !oldMessage.content || !newMessage.content) return;
-
-    if (oldMessage.content !== newMessage.content) {
-        const logChannel = newMessage.guild.channels.cache.get(LOG_CHANNEL_ID);
-        if (!logChannel) return;
-
-        const dateStr = getDateStr();
-        const authorTag = `<@${newMessage.author.id}>`;
-        const editLog = `✏️️ ${dateStr} | แก้ไขข้อความ\nผู้ส่ง: ${authorTag} | ช่อง : <#${newMessage.channel.id}>\n"${oldMessage.content}"เป็น : "${newMessage.content}"`;
-        logChannel.send(editLog);
+    if (content === 'Nivalor') {
+        await message.reply({
+            content: 'GRRRR...',
+            allowedMentions: {
+                repliedUser: false
+            }
+        }).catch(console.error);
     }
 });
 
-// STATUS
+// ===== VIRUS LOG BUTTON HANDLER =====
+client.on('interactionCreate', async interaction => {
+    if (!interaction.isButton()) return;
+
+    const parts = interaction.customId.split(':');
+
+    if (parts[0] !== 'virus' || parts.length !== 4) {
+        return;
+    }
+
+    const [, action, guildId, targetId] = parts;
+
+    if (!['kickclear', 'clear', 'nothing'].includes(action)) {
+        return;
+    }
+
+    if (
+        !interaction.inGuild() ||
+        interaction.guildId !== guildId
+    ) {
+        return interaction.reply({
+            content: '❌ ปุ่มนี้ไม่ตรงกับเซิร์ฟเวอร์',
+            ephemeral: true
+        });
+    }
+
+    if (
+        interaction.message.author?.id !== client.user?.id ||
+        interaction.channelId !== LOG_CHANNEL_ID
+    ) {
+        return interaction.reply({
+            content: '❌ ปุ่มนี้ใช้ได้เฉพาะข้อความแจ้งเตือนของบอทในห้อง Log',
+            ephemeral: true
+        });
+    }
+
+    if (
+        !interaction.memberPermissions?.has(
+            PermissionFlagsBits.Administrator
+        )
+    ) {
+        return interaction.reply({
+            content: '⛔ ปุ่มนี้ใช้ได้เฉพาะแอดมินที่มีสิทธิ์ Administrator',
+            ephemeral: true
+        });
+    }
+
+    if (virusActionLocks.has(interaction.message.id)) {
+        return interaction.reply({
+            content: 'รายการนี้กำลังดำเนินการหรือถูกจัดการไปแล้ว',
+            ephemeral: true
+        });
+    }
+
+    virusActionLocks.add(interaction.message.id);
+
+    const originalContent =
+        interaction.message.content || '🚨 Virus Log';
+
+    try {
+        await interaction.deferUpdate();
+
+        // ===== NOTHING =====
+        if (action === 'nothing') {
+            await interaction.editReply({
+                content:
+                    `${originalContent}\n\n` +
+                    '🟦 **แอดมินเลือก Nothing**\n' +
+                    'ไม่ได้เตะสมาชิกและไม่ได้ลบข้อความย้อนหลัง',
+                components: [],
+                allowedMentions: { parse: [] }
+            });
+
+            return;
+        }
+
+        // ===== SHOW PENDING ACTION =====
+        const pendingAction = action === 'kickclear'
+            ? 'Kick and Clear: กำลังลบข้อความ @everyone ย้อนหลัง 1 ชั่วโมง และจะพยายามเตะสมาชิก'
+            : 'Clear: กำลังลบข้อความ @everyone ย้อนหลัง 1 ชั่วโมง';
+
+        await interaction.editReply({
+            content:
+                `${originalContent}\n\n` +
+                `⏳ **${pendingAction}...**`,
+            components: [
+                createVirusButtons(guildId, targetId, true)
+            ],
+            allowedMentions: { parse: [] }
+        });
+
+        // ===== CLEAR MESSAGES =====
+        let clearResult = null;
+        let clearError = null;
+
+        try {
+            clearResult = await deleteEveryoneMessagesLastHour(
+                interaction.guild,
+                targetId,
+                interaction.user.id
+            );
+        } catch (error) {
+            clearError = error;
+            console.error('Virus Clear Error:', error);
+        }
+
+        // ===== KICK MEMBER IF REQUESTED =====
+        let kickStatus = '';
+
+        if (action === 'kickclear') {
+            try {
+                const targetMember =
+                    await interaction.guild.members
+                        .fetch(targetId)
+                        .catch(() => null);
+
+                if (!targetMember) {
+                    kickStatus =
+                        '⚠️ เตะไม่สำเร็จ: ไม่พบสมาชิกคนนี้ในเซิร์ฟเวอร์แล้ว';
+                } else if (!targetMember.kickable) {
+                    kickStatus =
+                        '❌ เตะไม่สำเร็จ: บอทไม่มีสิทธิ์เตะสมาชิกคนนี้ หรือยศของบอทต่ำกว่า/เท่ากับสมาชิก';
+                } else {
+                    await targetMember.kick(
+                        `แอดมิน ${interaction.user.tag} เลือก Kick and Clear จากระบบตรวจจับสแปม @everyone`
+                    );
+
+                    kickStatus =
+                        `✅ เตะสมาชิก <@${targetId}> ออกจากเซิร์ฟเวอร์แล้ว`;
+                }
+            } catch (error) {
+                kickStatus =
+                    `❌ เตะไม่สำเร็จ: ${limitText(error.message, 250)}`;
+
+                console.error('Virus Kick Error:', error);
+            }
+        }
+
+        // ===== BUILD RESULT =====
+        const resultLines = [
+            action === 'kickclear'
+                ? '🛡️ **ผลการดำเนินการ: Kick and Clear**'
+                : '🧹 **ผลการดำเนินการ: Clear**',
+
+            `สมาชิกเป้าหมาย: <@${targetId}>`,
+
+            clearResult
+                ? `ห้องที่ค้นหา: ${clearResult.channels} ห้อง`
+                : 'การค้นหา: ไม่สำเร็จ',
+
+            clearResult
+                ? `ข้อความที่ตรวจสอบ: ${clearResult.checked} ข้อความ`
+                : '',
+
+            clearResult
+                ? `ข้อความที่ตรงเงื่อนไข: ${clearResult.found} ข้อความ`
+                : '',
+
+            clearResult
+                ? `ลบสำเร็จ: ${clearResult.deleted} ข้อความ`
+                : '',
+
+            clearResult
+                ? `ลบไม่สำเร็จ: ${clearResult.deleteFailures} ข้อความ`
+                : '',
+
+            clearResult
+                ? `ส่ง Message Delete Log ไม่สำเร็จ: ${clearResult.logFailures} รายการ`
+                : '',
+
+            clearResult
+                ? `อ่านประวัติห้องไม่สำเร็จ: ${clearResult.readFailures} ห้อง`
+                : '',
+
+            clearError
+                ? `❌ สาเหตุที่ค้นหา/ลบไม่สำเร็จ: ${limitText(clearError.message, 300)}`
+                : '',
+
+            kickStatus,
+
+            '',
+
+            'หมายเหตุ: Log การลบข้อความจะบันทึกในรูปแบบเดียวกับการลบข้อความทั่วไป พร้อมระบุว่าบอทดำเนินการตามคำสั่งของแอดมิน'
+        ].filter(Boolean);
+
+        await interaction.editReply({
+            content: limitText(
+                `${originalContent}\n\n${resultLines.join('\n')}`,
+                1950
+            ),
+            components: [],
+            allowedMentions: { parse: [] }
+        });
+    } catch (error) {
+        console.error('Virus Button Error:', error);
+
+        const errorText = limitText(
+            `${originalContent}\n\n❌ **ดำเนินการไม่สำเร็จ:** ${error.message}`,
+            1950
+        );
+
+        if (interaction.deferred || interaction.replied) {
+            await interaction.editReply({
+                content: errorText,
+                components: [],
+                allowedMentions: { parse: [] }
+            }).catch(console.error);
+        } else {
+            await interaction.reply({
+                content: `❌ ไม่สามารถดำเนินการได้: ${error.message}`,
+                ephemeral: true
+            }).catch(console.error);
+        }
+    } finally {
+        virusActionLocks.delete(interaction.message.id);
+    }
+});
+
+// ===== MESSAGE UPDATE LOG =====
+client.on('messageUpdate', async (oldMessage, newMessage) => {
+    if (!newMessage.guild || newMessage.author?.bot) {
+        return;
+    }
+
+    let oldFull = oldMessage;
+    let newFull = newMessage;
+
+    if (oldFull.partial) {
+        oldFull = await oldFull.fetch().catch(() => oldFull);
+    }
+
+    if (newFull.partial) {
+        newFull = await newFull.fetch().catch(() => newFull);
+    }
+
+    if (!oldFull.content && !newFull.content) return;
+    if (oldFull.content === newFull.content) return;
+
+    const logChannel = await getLogChannel(newMessage.guild);
+
+    if (!logChannel) return;
+
+    const dateStr = getDateStr();
+
+    const authorTag = newMessage.author
+        ? `<@${newMessage.author.id}>`
+        : 'ไม่ทราบผู้ใช้';
+
+    const editLog =
+        `✏️ ${dateStr} | แก้ไขข้อความ\n` +
+        `ผู้ส่ง: ${authorTag} | ช่อง: <#${newMessage.channel.id}>\n` +
+        `ก่อนแก้: "${limitText(oldFull.content || '[ไม่มีข้อความ]', 700)}"\n` +
+        `หลังแก้: "${limitText(newFull.content || '[ไม่มีข้อความ]', 700)}"`;
+
+    await logChannel.send({
+        content: limitText(editLog, 1900),
+        allowedMentions: { parse: [] }
+    }).catch(console.error);
+});
+
+// ===== STATUS =====
 const statusList = [
-    { name: 'custom', type: ActivityType.Custom, state: 'โฮกปิ๊บ!' },
-    { name: 'custom', type: ActivityType.Custom, state: 'ค่อกก!' },
-    { name: 'custom', type: ActivityType.Custom, state: 'โฮกกก!' },
-    { name: 'custom', type: ActivityType.Custom, state: 'ROAAR!' },
-    { name: 'custom', type: ActivityType.Custom, state: 'GRAAAAH!' },
-    { name: 'custom', type: ActivityType.Custom, state: 'GARRR!' },
-    { name: 'custom', type: ActivityType.Custom, state: 'กรือออ...' },
-    { name: 'custom', type: ActivityType.Custom, state: 'GRRRR...' }
+    {
+        name: 'custom',
+        type: ActivityType.Custom,
+        state: 'โฮกปิ๊บ!'
+    },
+    {
+        name: 'custom',
+        type: ActivityType.Custom,
+        state: 'ค่อกก!'
+    },
+    {
+        name: 'custom',
+        type: ActivityType.Custom,
+        state: 'โฮกกก!'
+    },
+    {
+        name: 'custom',
+        type: ActivityType.Custom,
+        state: 'ROAAR!'
+    },
+    {
+        name: 'custom',
+        type: ActivityType.Custom,
+        state: 'GRAAAAH!'
+    },
+    {
+        name: 'custom',
+        type: ActivityType.Custom,
+        state: 'GARRR!'
+    },
+    {
+        name: 'custom',
+        type: ActivityType.Custom,
+        state: 'กรือออ...'
+    },
+    {
+        name: 'custom',
+        type: ActivityType.Custom,
+        state: 'GRRRR...'
+    }
 ];
 
 function setRandomStatus() {
     if (!client.user) return;
-    const randomStatus = statusList[Math.floor(Math.random() * statusList.length)];
-    client.user.setPresence({ activities: [randomStatus] });
+
+    const randomStatus =
+        statusList[Math.floor(Math.random() * statusList.length)];
+
+    client.user.setPresence({
+        activities: [randomStatus]
+    });
 }
 
-// DISCORD LOGGING
-client.on('error', error => console.error('❌ Discord Client Error:', error));
-client.on('warn', warning => console.warn('⚠️ Discord Warning:', warning));
-client.on('shardError', (error, shardId) => console.error(`❌ Discord Shard ${shardId} Error:`, error));
+// ===== DISCORD LOGGING =====
+client.on('error', error =>
+    console.error('❌ Discord Client Error:', error)
+);
 
-// READY
+client.on('warn', warning =>
+    console.warn('⚠️ Discord Warning:', warning)
+);
+
+client.on('shardError', (error, shardId) =>
+    console.error(
+        `❌ Discord Shard ${shardId} Error:`,
+        error
+    )
+);
+
+// ===== READY =====
 client.once('ready', () => {
-    console.log(`✅ บอท ${client.user.tag} ออนไลน์ (Render)`);
+    console.log(
+        `✅ บอท ${client.user.tag} ออนไลน์ (Render)`
+    );
+
     setRandomStatus();
-    setInterval(setRandomStatus, 17 * 24 * 60 * 60 * 1000);
+
+    setInterval(
+        setRandomStatus,
+        17 * 24 * 60 * 60 * 1000
+    );
 });
 
-// PROCESS ERROR
-process.on('unhandledRejection', error => console.error('❌ Unhandled Promise Rejection:', error));
-process.on('uncaughtException', error => console.error('❌ Uncaught Exception:', error));
+// ===== PROCESS ERROR =====
+process.on('unhandledRejection', error =>
+    console.error('❌ Unhandled Promise Rejection:', error)
+);
 
-// LOGIN & GATEWAY TEST
+process.on('uncaughtException', error =>
+    console.error('❌ Uncaught Exception:', error)
+);
+
+// ===== LOGIN & GATEWAY TEST =====
 if (!process.env.DISCORD_TOKEN) {
-    console.error('❌ ไม่พบ DISCORD_TOKEN ใน Render Environment Variables');
+    console.error(
+        '❌ ไม่พบ DISCORD_TOKEN ใน Render Environment Variables'
+    );
+
     process.exit(1);
 }
 
 async function testDiscordGateway() {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    const timeout = setTimeout(
+        () => controller.abort(),
+        15000
+    );
+
     try {
-        const response = await fetch('https://discord.com/api/v10/gateway/bot', {
-            headers: { 'Authorization': `Bot ${process.env.DISCORD_TOKEN}` },
-            signal: controller.signal
-        });
+        const response = await fetch(
+            'https://discord.com/api/v10/gateway/bot',
+            {
+                headers: {
+                    Authorization: `Bot ${process.env.DISCORD_TOKEN}`
+                },
+                signal: controller.signal
+            }
+        );
+
         const body = await response.text();
+
         if (!response.ok) {
             console.error(`❌ Discord ตอบกลับ: ${body}`);
             return false;
         }
+
         return true;
     } catch (error) {
-        console.error('❌ Discord Gateway Test Failed:', error.message);
+        console.error(
+            '❌ Discord Gateway Test Failed:',
+            error.message
+        );
+
         return false;
     } finally {
         clearTimeout(timeout);
@@ -825,6 +2369,16 @@ async function testDiscordGateway() {
 testDiscordGateway().then(success => {
     if (success) {
         console.log('🔄 กำลัง Login เข้า Discord...');
-        client.login(process.env.DISCORD_TOKEN);
+
+        client.login(process.env.DISCORD_TOKEN).catch(error => {
+            console.error(
+                '❌ Login เข้า Discord ไม่สำเร็จ:',
+                error
+            );
+        });
+    } else {
+        console.error(
+            '❌ Gateway Test ไม่ผ่าน จึงยังไม่ Login'
+        );
     }
 });
